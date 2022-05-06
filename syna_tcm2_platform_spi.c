@@ -89,6 +89,8 @@ static void syna_spi_hw_reset(struct syna_hw_interface *hw_if)
 {
 	struct syna_hw_rst_data *rst = &hw_if->bdata_rst;
 
+	LOGI("Trigger hardware reset.\n");
+
 	if (rst->reset_gpio >= 0) {
 		gpio_set_value(rst->reset_gpio, rst->reset_on_state);
 		syna_pal_sleep_ms(rst->reset_active_ms);
@@ -446,6 +448,7 @@ static int syna_spi_parse_dt(struct syna_hw_interface *hw_if,
 	int retval;
 	int index;
 	u32 value;
+	u32 coords[2];
 	struct property *prop;
 	struct device_node *np = dev->of_node;
 	const char *name;
@@ -657,6 +660,42 @@ static int syna_spi_parse_dt(struct syna_hw_interface *hw_if,
 		bus->spi_mode = 0;
 	}
 
+	prop = of_find_property(np, "synaptics,pixels-per-mm", NULL);
+	if (prop && prop->length) {
+		retval = of_property_read_u32(np, "synaptics,pixels-per-mm",
+				&value);
+		if (retval < 0) {
+			LOGE("Fail to read synaptics,pixels-per-mm\n");
+			return retval;
+		}
+
+		hw_if->pixels_per_mm = value;
+
+	} else {
+		/*
+		 * Set default as 1 to let the driver report the value from the
+		 * touch IC if pixels_per_mm is not set.
+		 */
+		hw_if->pixels_per_mm = 1;
+	}
+
+	prop = of_find_property(np, "synaptics,compression-threshold", NULL);
+	if (prop && prop->length) {
+		retval = of_property_read_u32(np, "synaptics,compression-threshold",
+				&value);
+		if (retval < 0) {
+			LOGE("Fail to read synaptics,compression-threshold\n");
+			return retval;
+		}
+
+		hw_if->compression_threhsold = value;
+	} else {
+		/*
+		 * Set default as 15.
+		 */
+		hw_if->compression_threhsold = 15;
+	}
+
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
 	hw_if->offload_id = 0;
 	retval = of_property_read_u8_array(np, "synaptics,touch_offload_id",
@@ -672,6 +711,14 @@ static int syna_spi_parse_dt(struct syna_hw_interface *hw_if,
 		    hw_if->offload_id);
 	}
 #endif
+
+	if (of_property_read_u32_array(np, "synaptics,udfps-coords", coords, 2)) {
+		dev_err(dev, "synaptics,udfps-coords not found\n");
+		coords[0] = 0;
+		coords[1] = 0;
+	}
+	hw_if->udfps_x = coords[0];
+	hw_if->udfps_y = coords[1];
 
 	return 0;
 }

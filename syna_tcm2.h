@@ -57,6 +57,8 @@
 #include <heatmap.h>
 #endif
 
+#include <linux/pm_qos.h>
+
 #define PLATFORM_DRIVER_NAME "synaptics_tcm"
 
 #define TOUCH_INPUT_NAME "synaptics_tcm_touch"
@@ -299,6 +301,28 @@ enum {
 	SYNA_BUS_REF_BUGREPORT		= 0x0020,
 };
 
+/* Motion filter finite state machine (FSM) states
+ * MF_FILTERED        - default coordinate filtering
+ * MF_UNFILTERED      - unfiltered single-touch coordinates
+ * MF_FILTERED_LOCKED - filtered coordinates. Locked until touch is lifted.
+ */
+typedef enum {
+	MF_FILTERED		= 0,
+	MF_UNFILTERED		= 1,
+	MF_FILTERED_LOCKED	= 2
+} motion_filter_state_t;
+
+/* Motion filter mode.
+ *  MF_OFF    : 0 = Always unfilter.
+ *  MF_DYNAMIC: 1 = Dynamic change motion filter.
+ *  MF_ON     : 2 = Always filter by touch FW.
+ */
+enum MF_MODE {
+    MF_OFF,
+    MF_DYNAMIC,
+    MF_ON,
+};
+
 #if defined(ENABLE_HELPER)
 /**
  * @brief: Tasks for helper
@@ -406,6 +430,8 @@ struct syna_tcm {
 	/* Workqueue used for fw update */
 	struct delayed_work reflash_work;
 	struct workqueue_struct *reflash_workqueue;
+	u8 reflash_count;
+	bool force_reflash;
 
 	struct work_struct suspend_work;
 	struct work_struct resume_work;
@@ -424,14 +450,31 @@ struct syna_tcm {
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
 	struct touch_offload_context offload;
 	u16 *heatmap_buff;
-	struct hrtimer heatmap_timer;
 	struct touch_offload_frame *reserved_frame;
+	bool reserved_frame_success;
 #endif
 
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_HEATMAP)
 	bool heatmap_decoded;
 	struct v4l2_heatmap v4l2;
 #endif
+
+	/* Motion filter mode.
+	 *  0 = Always unfilter.
+	 *  1 = Dynamic change motion filter.
+	 *  2 = Always filter by touch FW.
+	 */
+	u8 mf_mode;
+	/* Payload for continuously report. */
+	u16 set_continuously_report;
+	/* Motion filter finite state machine (FSM) state */
+	motion_filter_state_t mf_state;
+	/* Time of initial single-finger touch down. This timestamp is used to
+	 * compute the duration a single finger is touched before it is lifted.
+	 */
+	ktime_t mf_downtime;
+	/* Work for motion filter commands. */
+	struct work_struct motion_filter_work;
 
 	/* IOCTL-related variables */
 	pid_t proc_pid;
@@ -453,6 +496,8 @@ struct syna_tcm {
 	s16 *raw_data_buffer;
 	struct completion raw_data_completion;
 	bool high_sensitivity_mode;
+	u8 enable_fw_grip;
+	u8 enable_fw_palm;
 
 #if defined(USE_DRM_BRIDGE)
 	struct drm_bridge panel_bridge;
@@ -463,6 +508,8 @@ struct syna_tcm {
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_TBN)
 	u32 tbn_register_mask;
 #endif
+
+	struct pm_qos_request pm_qos_req;
 
 	/* fifo to pass the data to userspace */
 	unsigned int fifo_remaining_frame;

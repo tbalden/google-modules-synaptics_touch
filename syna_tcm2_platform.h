@@ -146,9 +146,13 @@ struct syna_hw_interface {
 	struct syna_hw_rst_data bdata_rst;
 	struct syna_hw_pwr_data bdata_pwr;
 	const char *fw_name;
+	int pixels_per_mm;
+	u16 compression_threhsold;
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
 	u32 offload_id;
 #endif
+	int udfps_x;
+	int udfps_y;
 
 	/* Operation to do power on/off, if supported
 	 *
