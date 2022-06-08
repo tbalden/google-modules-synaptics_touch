@@ -103,74 +103,6 @@ static unsigned char custom_touch_format[] = {
 	struct drm_panel *active_panel;
 #endif
 
-
-#if defined(ENABLE_HELPER)
-/**
- * syna_dev_reset_detected_cb()
- *
- * Callback to assign a task to helper thread.
- *
- * Please be noted that this function will be invoked in ISR so don't
- * issue another touchcomm command here.
- *
- * @param
- *    [ in] callback_data: pointer to caller data
- *
- * @return
- *    on success, 0 or positive value; otherwise, negative value on error.
- */
-static void syna_dev_reset_detected_cb(void *callback_data)
-{
-	struct syna_tcm *tcm = (struct syna_tcm *)callback_data;
-
-	if (!tcm->helper.workqueue) {
-		LOGW("No helper thread created\n");
-		return;
-	}
-
-#ifdef RESET_ON_RESUME
-	if (tcm->pwr_state != PWR_ON)
-		return;
-#endif
-
-	if (ATOMIC_GET(tcm->helper.task) == HELP_NONE) {
-		ATOMIC_SET(tcm->helper.task, HELP_RESET_DETECTED);
-
-		queue_work(tcm->helper.workqueue, &tcm->helper.work);
-	}
-}
-/**
- * syna_dev_helper_work()
- *
- * According to the given task, perform the delayed work
- *
- * @param
- *    [ in] work: data for work used
- *
- * @return
- *    on success, 0; otherwise, negative value on error.
- */
-static void syna_dev_helper_work(struct work_struct *work)
-{
-	unsigned char task;
-	struct syna_tcm_helper *helper =
-			container_of(work, struct syna_tcm_helper, work);
-	struct syna_tcm *tcm =
-			container_of(helper, struct syna_tcm, helper);
-
-	task = ATOMIC_GET(helper->task);
-
-	switch (task) {
-	case HELP_RESET_DETECTED:
-		LOGD("Reset caught (device mode:0x%x)\n", tcm->tcm_dev->dev_mode);
-		break;
-	default:
-		break;
-	}
-
-	ATOMIC_SET(helper->task, HELP_NONE);
-}
-#endif
 /**
  * syna_dev_enable_lowpwr_gesture()
  *
@@ -279,29 +211,40 @@ static void syna_dev_set_heatmap_mode(struct syna_tcm *tcm, bool en)
  *
  * @param
  *    [ in] tcm: tcm driver handle
+ *    [ in] delay_ms_resp: delay time for response reading.
+ *                         a positive value presents the time for polling;
+ *                         or, set '0' or 'RESP_IN_ATTN' for ATTN driven
  *
  * @return
  *    on success, 0; otherwise, negative value on error.
  */
-static void syna_dev_restore_feature_setting(struct syna_tcm *tcm)
+static void syna_dev_restore_feature_setting(struct syna_tcm *tcm, unsigned int delay_ms_resp)
 {
 	syna_dev_set_heatmap_mode(tcm, true);
 
 	syna_tcm_set_dynamic_config(tcm->tcm_dev,
 			DC_ENABLE_PALM_REJECTION,
 			(tcm->enable_fw_palm & 0x01),
-			RESP_IN_POLLING);
+			delay_ms_resp);
 
 	syna_tcm_set_dynamic_config(tcm->tcm_dev,
 			DC_ENABLE_GRIP_SUPPRESSION,
 			(tcm->enable_fw_grip & 0x01),
-			RESP_IN_POLLING);
+			delay_ms_resp);
 
 	syna_tcm_set_dynamic_config(tcm->tcm_dev,
 			DC_COMPRESSION_THRESHOLD,
 			tcm->hw_if->compression_threhsold,
-			RESP_IN_POLLING);
+			delay_ms_resp);
+
+	if (tcm->hw_if->dynamic_report_rate) {
+		syna_tcm_set_dynamic_config(tcm->tcm_dev,
+				DC_REPORT_RATE_SWITCH,
+				tcm->touch_report_rate_config,
+				delay_ms_resp);
+	}
 }
+
 /* Update a state machine used to toggle control of the touch IC's motion
  * filter.
  */
@@ -380,6 +323,97 @@ static void syna_motion_filter_work(struct work_struct *work)
 			RESP_IN_ATTN);
 }
 
+static void syna_set_report_rate_work(struct work_struct *work)
+{
+	struct syna_tcm *tcm;
+	struct delayed_work *delayed_work;
+	delayed_work = container_of(work, struct delayed_work, work);
+	tcm = container_of(delayed_work, struct syna_tcm, set_report_rate_work);
+
+	if (tcm->touch_count != 0) {
+		queue_delayed_work(tcm->event_wq, &tcm->set_report_rate_work,
+				msecs_to_jiffies(10));
+		return;
+	}
+
+	tcm->touch_report_rate_config = tcm->next_report_rate_config;
+	syna_tcm_set_dynamic_config(tcm->tcm_dev,
+			DC_REPORT_RATE_SWITCH,
+			tcm->touch_report_rate_config,
+			RESP_IN_ATTN);
+	LOGI("Set touch report rate as %dHz",
+		(tcm->touch_report_rate_config == CONFIG_HIGH_REPORT_RATE) ? 240 : 120);
+}
+
+#if defined(ENABLE_HELPER)
+/**
+ * syna_dev_reset_detected_cb()
+ *
+ * Callback to assign a task to helper thread.
+ *
+ * Please be noted that this function will be invoked in ISR so don't
+ * issue another touchcomm command here.
+ *
+ * @param
+ *    [ in] callback_data: pointer to caller data
+ *
+ * @return
+ *    on success, 0 or positive value; otherwise, negative value on error.
+ */
+static void syna_dev_reset_detected_cb(void *callback_data)
+{
+	struct syna_tcm *tcm = (struct syna_tcm *)callback_data;
+
+	if (!tcm->helper.workqueue) {
+		LOGW("No helper thread created\n");
+		return;
+	}
+
+#ifdef RESET_ON_RESUME
+	if (tcm->pwr_state != PWR_ON)
+		return;
+#endif
+
+	if (ATOMIC_GET(tcm->helper.task) == HELP_NONE) {
+		ATOMIC_SET(tcm->helper.task, HELP_RESET_DETECTED);
+
+		queue_work(tcm->helper.workqueue, &tcm->helper.work);
+	}
+}
+/**
+ * syna_dev_helper_work()
+ *
+ * According to the given task, perform the delayed work
+ *
+ * @param
+ *    [ in] work: data for work used
+ *
+ * @return
+ *    on success, 0; otherwise, negative value on error.
+ */
+static void syna_dev_helper_work(struct work_struct *work)
+{
+	unsigned char task;
+	struct syna_tcm_helper *helper =
+			container_of(work, struct syna_tcm_helper, work);
+	struct syna_tcm *tcm =
+			container_of(helper, struct syna_tcm, helper);
+
+	task = ATOMIC_GET(helper->task);
+
+	switch (task) {
+	case HELP_RESET_DETECTED:
+		LOGI("Reset caught (device mode:0x%x)\n", tcm->tcm_dev->dev_mode);
+		syna_dev_restore_feature_setting(tcm, RESP_IN_ATTN);
+		break;
+	default:
+		break;
+	}
+
+	ATOMIC_SET(helper->task, HELP_NONE);
+}
+#endif
+
 #ifdef ENABLE_CUSTOM_TOUCH_ENTITY
 /**
  * syna_dev_parse_custom_touch_data_cb()
@@ -410,29 +444,47 @@ static int syna_dev_parse_custom_touch_data_cb(const unsigned char code,
 		const unsigned char *report, unsigned int *report_offset,
 		unsigned int report_size, void *callback_data)
 {
-	/**
-	 * sample code to demonstrate how to parse the custom touch entity
-	 * from the touch report, additional modifications will be needed.
-	 *
-	 * struct syna_tcm *tcm = (struct syna_tcm *)callback_data;
-	 * unsigned int data;
-	 * unsigned int bits;
-	 *
-	 * switch (code) {
-	 * case CUSTOM_ENTITY_CODE:
-	 *		bits = config[(*config_offset)++];
-	 *		syna_tcm_get_touch_data(report, report_size,
-	 *				*report_offset, bits, &data);
-	 *
-	 *		*report_offset += bits;
-	 *		return bits;
-	 *	default:
-	 *		LOGW("Unknown touch config code (idx:%d 0x%02x)\n",
-	 *			*config_offset, code);
-	 *		return (-EINVAL);
-	 *	}
-	 *
-	 */
+	struct syna_tcm *tcm = (struct syna_tcm *)callback_data;
+	struct tcm_touch_data_blob *touch_data;
+	struct tcm_objects_data_blob *object_data;
+	unsigned int data;
+	unsigned int bits;
+
+	touch_data = &tcm->tp_data;
+	object_data = touch_data->object_data;
+
+	switch (code) {
+	case TOUCH_ENTITY_CUSTOM_ANGLE:
+		bits = config[(*config_offset)++];
+		syna_tcm_get_touch_data(report, report_size,
+				*report_offset, bits, &data);
+
+		object_data[touch_data->obji].custom_data[CUSTOM_DATA_ANGLE] = data;
+
+		*report_offset += bits;
+		return bits;
+	case TOUCH_ENTITY_CUSTOM_MAJOR:
+		bits = config[(*config_offset)++];
+		syna_tcm_get_touch_data(report, report_size,
+				*report_offset, bits, &data);
+
+		object_data[touch_data->obji].custom_data[CUSTOM_DATA_MAJOR] = data;
+
+		*report_offset += bits;
+		return bits;
+	case TOUCH_ENTITY_CUSTOM_MINOR:
+		bits = config[(*config_offset)++];
+		syna_tcm_get_touch_data(report, report_size,
+				*report_offset, bits, &data);
+
+		object_data[touch_data->obji].custom_data[CUSTOM_DATA_MINOR] = data;
+		*report_offset += bits;
+		return bits;
+	default:
+		LOGW("Unknown touch config code (idx:%d 0x%02x)\n",
+			*config_offset, code);
+		return (-EINVAL);
+	}
 
 	return (-EINVAL);
 }
@@ -600,8 +652,15 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 	unsigned int x;
 	unsigned int y;
 	unsigned int z;
+#ifdef ENABLE_CUSTOM_TOUCH_ENTITY
+	int major;
+	int minor;
+	int angle;
+#else
 	int wx;
 	int wy;
+#endif
+
 	unsigned int status;
 	unsigned int touch_count;
 	struct input_dev *input_dev = tcm->input_dev;
@@ -664,12 +723,22 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 		case PALM:
 			x = object_data[idx].x_pos;
 			y = object_data[idx].y_pos;
+#ifdef ENABLE_CUSTOM_TOUCH_ENTITY
+			major = object_data[idx].custom_data[CUSTOM_DATA_MAJOR];
+			minor = object_data[idx].custom_data[CUSTOM_DATA_MINOR];
+			angle = object_data[idx].custom_data[CUSTOM_DATA_ANGLE];
+			LOGD("Finger %d: major = %d, minor = %d, angle = %d.\n",
+				idx, major, minor, (s8) angle);
+			/* Report major and minor in display pixels. */
+			major = major * tcm->hw_if->pixels_per_mm;
+			minor = minor * tcm->hw_if->pixels_per_mm;
+#else
 			wx = object_data[idx].x_width;
 			wy = object_data[idx].y_width;
-
 			/* Report major and minor in display pixels. */
 			wx = wx * tcm->hw_if->pixels_per_mm;
 			wy = wy * tcm->hw_if->pixels_per_mm;
+#endif
 
 			if (object_data[idx].z == 0) {
 				z = 1;
@@ -693,8 +762,14 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 			tcm->offload.coords[idx].x = x;
 			tcm->offload.coords[idx].y = y;
 			tcm->offload.coords[idx].pressure = z;
-			tcm->offload.coords[idx].major = wx;
-			tcm->offload.coords[idx].minor = wy;
+#ifdef ENABLE_CUSTOM_TOUCH_ENTITY
+			tcm->offload.coords[idx].major = major;
+			tcm->offload.coords[idx].minor = minor;
+			tcm->offload.coords[idx].rotation = (s16) (((s8) angle) * 2048 / 45);
+#else
+			tcm->offload.coords[idx].major = MAX(wx, wy);
+			tcm->offload.coords[idx].minor = MIN(wx, wy);
+#endif
 			if (!tcm->offload.offload_running) {
 #endif
 #ifdef TYPE_B_PROTOCOL
@@ -708,10 +783,19 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 			input_report_abs(input_dev, ABS_MT_POSITION_Y, y);
 			input_report_abs(input_dev, ABS_MT_PRESSURE, z);
 #ifdef REPORT_TOUCH_WIDTH
+#ifdef ENABLE_CUSTOM_TOUCH_ENTITY
+			input_report_abs(input_dev,
+					ABS_MT_TOUCH_MAJOR, major);
+			input_report_abs(input_dev,
+					ABS_MT_TOUCH_MINOR, minor);
+			input_report_abs(input_dev,
+					ABS_MT_ORIENTATION, (s16) (((s8) angle) * 2048 / 45));
+#else
 			input_report_abs(input_dev,
 					ABS_MT_TOUCH_MAJOR, MAX(wx, wy));
 			input_report_abs(input_dev,
 					ABS_MT_TOUCH_MINOR, MIN(wx, wy));
+#endif
 #endif
 #ifndef TYPE_B_PROTOCOL
 			input_mt_sync(input_dev);
@@ -742,6 +826,7 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 
 	input_set_timestamp(input_dev, tcm->coords_timestamp);
 	input_sync(input_dev);
+	tcm->touch_count = touch_count;
 
 	syna_update_motion_filter(tcm, touch_count);
 
@@ -824,6 +909,9 @@ static int syna_dev_create_input_device(struct syna_tcm *tcm)
 	input_set_abs_params(input_dev,
 			ABS_MT_TOUCH_MINOR, 0, tcm_dev->max_y, 0, 0);
 #endif
+
+	input_set_abs_params(input_dev,
+			ABS_MT_ORIENTATION, -4096, 4096, 0, 0);
 
 	tcm->input_dev_params.max_x = tcm_dev->max_x;
 	tcm->input_dev_params.max_y = tcm_dev->max_y;
@@ -994,6 +1082,8 @@ static void syna_offload_report(void *handle,
 	int touch_count = 0;
 	int tool_type;
 
+	ATRACE_BEGIN("syna_offload_report");
+
 	syna_pal_mutex_lock(&tcm->tp_event_mutex);
 
 	input_set_timestamp(tcm->input_dev, report->timestamp);
@@ -1030,6 +1120,8 @@ static void syna_offload_report(void *handle,
 					 report->coords[i].minor);
 			input_report_abs(tcm->input_dev, ABS_MT_PRESSURE,
 					 report->coords[i].pressure);
+			input_report_abs(tcm->input_dev, ABS_MT_ORIENTATION,
+					 report->coords[i].rotation);
 		} else {
 			input_mt_slot(tcm->input_dev, i);
 			input_report_abs(tcm->input_dev, ABS_MT_PRESSURE, 0);
@@ -1043,9 +1135,13 @@ static void syna_offload_report(void *handle,
 	input_report_key(tcm->input_dev, BTN_TOOL_FINGER, touch_down);
 
 	input_sync(tcm->input_dev);
+	tcm->touch_count = touch_count;
+
 	syna_update_motion_filter(tcm, touch_count);
 
 	syna_pal_mutex_unlock(&tcm->tp_event_mutex);
+
+	ATRACE_END();
 }
 
 static int syna_dev_ptflib_decoder(struct syna_tcm *tcm, const u16 *in_array,
@@ -1197,16 +1293,25 @@ static void syna_populate_frame(struct syna_tcm *tcm, bool has_heatmap)
 	frame->header.index = index++;
 	frame->header.timestamp = tcm->coords_timestamp;
 
+	ATRACE_BEGIN(__func__);
+
 	/* Populate all channels */
 	for (i = 0; i < frame->num_channels; i++) {
 		if (frame->channel_type[i] == TOUCH_DATA_TYPE_COORD) {
+			ATRACE_BEGIN("populate coord");
 			syna_populate_coordinate_channel(tcm, frame, i);
+			ATRACE_END();
 		} else if ((frame->channel_type[i] & TOUCH_SCAN_TYPE_MUTUAL) != 0) {
+			ATRACE_BEGIN("populate mutual data");
 			syna_populate_mutual_channel(tcm, frame, i, has_heatmap);
+			ATRACE_END();
 		} else if ((frame->channel_type[i] & TOUCH_SCAN_TYPE_SELF) != 0) {
+			ATRACE_BEGIN("populate self data");
 			syna_populate_self_channel(tcm, frame, i, has_heatmap);
+			ATRACE_END();
 		}
 	}
+	ATRACE_END();
 }
 #endif /* CONFIG_TOUCHSCREEN_OFFLOAD */
 
@@ -1285,6 +1390,8 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 	struct syna_hw_attn_data *attn = &tcm->hw_if->bdata_attn;
 	struct tcm_dev *tcm_dev = tcm->tcm_dev;
 
+	ATRACE_BEGIN(__func__);
+
 	cpu_latency_qos_update_request(&tcm->pm_qos_req, 100 /* usec */);
 
 	/* It is possible that interrupts were disabled while the handler is
@@ -1304,6 +1411,7 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 		goto exit;
 	}
 #endif
+	ATRACE_BEGIN("get_event_data");
 	/* retrieve the original report date generated by firmware */
 	retval = syna_tcm_get_event_data(tcm->tcm_dev,
 			&code,
@@ -1312,6 +1420,7 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 		LOGE("Fail to get event data\n");
 		goto exit;
 	}
+	ATRACE_END();
 
 #ifdef ENABLE_EXTERNAL_FRAME_PROCESS
 	if (tcm->report_to_queue[code] == EFP_ENABLE) {
@@ -1359,7 +1468,9 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 #endif
 
 		/* forward the touch event to system */
+		ATRACE_BEGIN("report_input_events");
 		syna_dev_report_input_events(tcm);
+		ATRACE_END();
 	} else if (code == tcm->raw_data_report_code) {
 		if (!tcm->raw_data_buffer) {
 			tcm->raw_data_buffer = kmalloc(
@@ -1405,7 +1516,9 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 		}
 #endif
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_HEATMAP)
+		ATRACE_BEGIN("heatmap_read");
 		heatmap_read(&tcm->v4l2, ktime_to_ns(tcm->coords_timestamp));
+		ATRACE_END();
 #endif
 		break;
 	case REPORT_FW_STATUS:
@@ -1424,6 +1537,7 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 exit:
 	syna_set_bus_ref(tcm, SYNA_BUS_REF_IRQ, false);
 	cpu_latency_qos_update_request(&tcm->pm_qos_req, PM_QOS_DEFAULT_VALUE);
+	ATRACE_END();
 	return IRQ_HANDLED;
 }
 
@@ -1916,7 +2030,9 @@ static int syna_dev_resume(struct device *dev)
 	struct syna_tcm *tcm = dev_get_drvdata(dev);
 	struct syna_hw_interface *hw_if = tcm->hw_if;
 	bool irq_enabled = true;
+#ifdef RESET_ON_RESUME
 	unsigned char status;
+#endif
 
 	/* exit directly if device isn't in suspend state */
 	if (tcm->pwr_state == PWR_ON)
@@ -1989,7 +2105,7 @@ static int syna_dev_resume(struct device *dev)
 		goto exit;
 	}
 
-	syna_dev_restore_feature_setting(tcm);
+	syna_dev_restore_feature_setting(tcm, RESP_IN_POLLING);
 
 	retval = 0;
 
@@ -2036,6 +2152,9 @@ static int syna_dev_suspend(struct device *dev)
 		return 0;
 
 	LOGI("Prepare to suspend device\n");
+
+	if (tcm->hw_if->dynamic_report_rate)
+		cancel_delayed_work_sync(&tcm->set_report_rate_work);
 
 	reinit_completion(&tcm->bus_resumed);
 
@@ -2319,7 +2438,7 @@ static void syna_panel_bridge_enable(struct drm_bridge *bridge)
 	struct syna_tcm *tcm =
 			container_of(bridge, struct syna_tcm, panel_bridge);
 
-	pr_debug("%s\n", __func__);
+	LOGD("%s\n", __func__);
 	if (!tcm ->is_panel_lp_mode)
 		syna_set_bus_ref(tcm, SYNA_BUS_REF_SCREEN_ON, true);
 }
@@ -2336,7 +2455,7 @@ static void syna_panel_bridge_disable(struct drm_bridge *bridge)
 			return;
 	}
 
-	pr_debug("%s\n", __func__);
+	LOGD("%s\n", __func__);
 	syna_set_bus_ref(tcm, SYNA_BUS_REF_SCREEN_ON, false);
 }
 
@@ -2347,10 +2466,10 @@ static void syna_panel_bridge_mode_set(struct drm_bridge *bridge,
 	struct syna_tcm *tcm =
 			container_of(bridge, struct syna_tcm, panel_bridge);
 
-	pr_debug("%s\n", __func__);
+	LOGD("%s\n", __func__);
 
 	if (!tcm->connector || !tcm->connector->state) {
-		pr_info("%s: Get bridge connector.\n", __func__);
+		LOGI("%s: Get bridge connector.\n", __func__);
 		tcm->connector = syna_get_bridge_connector(bridge);
 	}
 
@@ -2359,6 +2478,31 @@ static void syna_panel_bridge_mode_set(struct drm_bridge *bridge,
 		syna_set_bus_ref(tcm, SYNA_BUS_REF_SCREEN_ON, false);
 	else
 		syna_set_bus_ref(tcm, SYNA_BUS_REF_SCREEN_ON, true);
+
+	if (mode && tcm->hw_if->dynamic_report_rate) {
+		int vrefresh = drm_mode_vrefresh(mode);
+		LOGD("Display refresh rate %dHz", vrefresh);
+		if (vrefresh == 120 || vrefresh == 90)
+			tcm->next_report_rate_config = CONFIG_HIGH_REPORT_RATE;
+		else
+			tcm->next_report_rate_config = CONFIG_LOW_REPORT_RATE;
+
+		if (tcm->last_vrefresh_rate != vrefresh)
+			cancel_delayed_work_sync(&tcm->set_report_rate_work);
+
+		if (tcm->next_report_rate_config != tcm->touch_report_rate_config &&
+			tcm->pwr_state == PWR_ON && tcm->bus_refmask != 0) {
+			/*
+			 * Queue the work immediately for increasing touch report rate
+			 * to 240Hz and queue 2 seconds delay work for decreasing
+			 * touch report rate.
+			 */
+			queue_delayed_work(tcm->event_wq, &tcm->set_report_rate_work,
+				(tcm->next_report_rate_config == CONFIG_HIGH_REPORT_RATE) ?
+				0 : msecs_to_jiffies(2 * MSEC_PER_SEC));
+		}
+		tcm->last_vrefresh_rate = vrefresh;
+	}
 }
 
 static const struct drm_bridge_funcs panel_bridge_funcs = {
@@ -2741,6 +2885,7 @@ static int syna_dev_probe(struct platform_device *pdev)
 	tcm->offload.caps.noise_reporting = false;
 	tcm->offload.caps.cancel_reporting = false;
 	tcm->offload.caps.size_reporting = true;
+	tcm->offload.caps.rotation_reporting = true;
 	tcm->offload.caps.filter_grip = true;
 	tcm->offload.caps.filter_palm = true;
 	tcm->offload.caps.num_sensitivity_settings = 1;
@@ -2783,6 +2928,9 @@ static int syna_dev_probe(struct platform_device *pdev)
 
 	INIT_WORK(&tcm->motion_filter_work, syna_motion_filter_work);
 
+	tcm->touch_report_rate_config = CONFIG_HIGH_REPORT_RATE;
+	INIT_DELAYED_WORK(&tcm->set_report_rate_work, syna_set_report_rate_work);
+
 #ifdef HAS_SYSFS_INTERFACE
 	/* create the device file and register to char device classes */
 	retval = syna_cdev_create_sysfs(tcm, pdev);
@@ -2795,7 +2943,7 @@ static int syna_dev_probe(struct platform_device *pdev)
 
 	tcm->enable_fw_grip = 0x00;
 	tcm->enable_fw_palm = 0x01;
-	syna_dev_restore_feature_setting(tcm);
+	syna_dev_restore_feature_setting(tcm, RESP_IN_POLLING);
 
 #if defined(USE_DRM_BRIDGE)
 	retval = syna_register_panel_bridge(tcm);
@@ -2904,6 +3052,8 @@ static int syna_dev_remove(struct platform_device *pdev)
 
 	cancel_work_sync(&tcm->suspend_work);
 	cancel_work_sync(&tcm->resume_work);
+	cancel_work_sync(&tcm->motion_filter_work);
+	cancel_delayed_work_sync(&tcm->set_report_rate_work);
 
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_TBN)
 	if (tcm->tbn_register_mask)

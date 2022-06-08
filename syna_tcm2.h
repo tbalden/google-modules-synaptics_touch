@@ -58,6 +58,7 @@
 #endif
 
 #include <linux/pm_qos.h>
+#include "../../../gs-google/drivers/soc/google/vh/kernel/systrace.h"
 
 #define PLATFORM_DRIVER_NAME "synaptics_tcm"
 
@@ -69,7 +70,7 @@
 
 #define SYNAPTICS_TCM_DRIVER_ID (1 << 0)
 #define SYNAPTICS_TCM_DRIVER_VERSION 1
-#define SYNAPTICS_TCM_DRIVER_SUBVER "2.6"
+#define SYNAPTICS_TCM_DRIVER_SUBVER "2.8"
 
 /**
  * @section: Driver Configurations
@@ -276,7 +277,7 @@
  *
  *        Set "disable" in default
  */
-/* #define ENABLE_HELPER */
+#define ENABLE_HELPER
 
 /**
  * @brief: Power States
@@ -376,6 +377,23 @@ enum custom_report_type {
 enum custom_gesture_type {
 	GESTURE_SINGLE_TAP = 6,
 	GESTURE_LONG_PRESS = 11,
+};
+#endif
+
+#if defined(ENABLE_CUSTOM_TOUCH_ENTITY)
+/**
+ * @brief: Custom touch entity code
+ */
+enum custom_gesture_type {
+	TOUCH_ENTITY_CUSTOM_ANGLE = 0xD1,
+	TOUCH_ENTITY_CUSTOM_MAJOR = 0xD2,
+	TOUCH_ENTITY_CUSTOM_MINOR = 0xD3,
+};
+
+enum custom_data {
+	CUSTOM_DATA_ANGLE = 0x0,
+	CUSTOM_DATA_MAJOR = 0x1,
+	CUSTOM_DATA_MINOR = 0x2,
 };
 #endif
 
@@ -479,6 +497,12 @@ struct syna_tcm {
 	/* IOCTL-related variables */
 	pid_t proc_pid;
 	struct task_struct *proc_task;
+
+	int touch_count;
+	bool touch_report_rate_config;
+	bool next_report_rate_config;
+	int last_vrefresh_rate;
+	struct delayed_work set_report_rate_work;
 
 	/* flags */
 	int pwr_state;

@@ -44,7 +44,7 @@
 #include "syna_tcm2_platform.h"
 
 
-#define SYNA_TCM_CORE_LIB_VERSION 0x0118
+#define SYNA_TCM_CORE_LIB_VERSION 0x0119
 
 
 /**
@@ -120,6 +120,9 @@
 
 #define RESP_IN_ATTN (1)
 #define RESP_IN_POLLING (CMD_RESPONSE_POLLING_DELAY_MS)
+
+#define CONFIG_HIGH_REPORT_RATE 0
+#define CONFIG_LOW_REPORT_RATE 1
 
 /**
  * @section: Macro to show string in log
@@ -221,6 +224,8 @@ enum dynamic_tcm_config_id {
 	DC_INHIBIT_ACTIVE_GESTURE = 0x0f,
 	DC_DISABLE_PROXIMITY = 0x10,
 	DC_HIGH_SENSITIVIRY_MODE = 0xCB,
+	/* Set 0 for high report rate(240Hz), 1 for low report rate(120Hz). */
+	DC_REPORT_RATE_SWITCH = 0xE6,
 	DC_FORCE_DOZE_MODE = 0xF0,
 	DC_COMPRESSION_THRESHOLD = 0xF1,
 	DC_TOUCH_SCAN_MODE = 0xF2,
@@ -510,6 +515,7 @@ struct tcm_objects_data_blob {
 	unsigned int z;
 	unsigned int tx_pos;
 	unsigned int rx_pos;
+	unsigned int custom_data[5];
 };
 struct tcm_gesture_data_blob {
 	union {
@@ -528,6 +534,7 @@ struct tcm_gesture_data_blob {
 struct tcm_touch_data_blob {
 
 	/* for each active objects */
+	unsigned int obji;
 	unsigned int num_of_active_objects;
 	struct tcm_objects_data_blob object_data[MAX_NUM_OBJECTS];
 
@@ -977,7 +984,6 @@ static inline void syna_tcm_buf_lock(struct tcm_buffer *pbuf)
 {
 	if (pbuf->ref_cnt != 0) {
 		LOGE("Buffer access out-of balance, %d\n", pbuf->ref_cnt);
-		return;
 	}
 
 	syna_pal_mutex_lock(&pbuf->buf_mutex);
@@ -998,7 +1004,6 @@ static inline void syna_tcm_buf_unlock(struct tcm_buffer *pbuf)
 {
 	if (pbuf->ref_cnt != 1) {
 		LOGE("Buffer access out-of balance, %d\n", pbuf->ref_cnt);
-		return;
 	}
 
 	pbuf->ref_cnt--;
