@@ -56,6 +56,13 @@
 #ifdef CONFIG_UCI
 #include <linux/inputfilter/sweep2sleep.h>
 #endif
+/* Init the kfifo for health check. */
+#define SYNA_HC_KFIFO_LEN 4 /* Must be power of 2. */
+DEFINE_KFIFO(hc_fifo, struct syna_health_check_fifo, SYNA_HC_KFIFO_LEN);
+
+/* Init the kfifo for touch event information. */
+#define SYNA_DEBUG_KFIFO_LEN 4 /* must be power of 2. */
+DEFINE_KFIFO(debug_fifo, struct syna_touch_info_fifo, SYNA_DEBUG_KFIFO_LEN);
 
 /**
  * @section: USE_CUSTOM_TOUCH_REPORT_CONFIG
@@ -106,6 +113,141 @@ static unsigned char custom_touch_format[] = {
 #ifdef USE_DRM_PANEL_NOTIFIER
 	struct drm_panel *active_panel;
 #endif
+
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
+static void reserve_then_queue_frame(struct syna_tcm *tcm, bool has_heatmap);
+#endif
+
+#ifdef SYNA_HC_KFIFO_LEN
+inline void syna_hc_update_and_push(struct syna_tcm *tcm, struct syna_health_check_fifo *hc)
+{
+	hc->int_ktime = tcm->isr_timestamp;
+	hc->int_idx = tcm->syna_hc.int_cnt;
+	hc->coord_idx = tcm->syna_hc.coord_event_cnt;
+	hc->status_idx = tcm->syna_hc.status_event_cnt;
+	hc->active_bit = tcm->syna_hc.touch_idx_state;
+
+	/*
+	 * Use kfifo as circular buffer by skipping one element
+	 * when fifo is full.
+	 */
+	if (kfifo_is_full(&hc_fifo))
+		kfifo_skip(&hc_fifo);
+	kfifo_in(&hc_fifo, hc, 1);
+}
+
+inline void syna_hc_dump(struct syna_tcm *tcm)
+{
+	int i;
+	u64 count;
+	s64 delta;
+	s64 sec_delta;
+	u32 ms_delta;
+	ktime_t current_time = ktime_get();
+	struct syna_health_check_fifo last_hc_fifo[SYNA_HC_KFIFO_LEN] = { 0 };
+
+	count = min(tcm->syna_hc.int_cnt, (u64) ARRAY_SIZE(last_hc_fifo));
+	if (kfifo_out_peek(&hc_fifo, last_hc_fifo, count) != count) {
+		LOGE("Fail to peak health check data.\n");
+		return;
+	}
+
+	for (i = 0 ; i < count ; i++) {
+		sec_delta = 0;
+		ms_delta = 0;
+		delta = ktime_ms_delta(current_time, last_hc_fifo[i].int_ktime);
+		if (delta > 0)
+			sec_delta = div_u64_rem(delta, MSEC_PER_SEC, &ms_delta);
+
+		LOGI("dump-int: #%llu(%llu.%u): S#%llu%s C#%llu(0x%lx)%s.\n",
+			last_hc_fifo[i].int_idx,
+			sec_delta, ms_delta,
+			last_hc_fifo[i].status_idx,
+			(last_hc_fifo[i].status_updated) ? "(+)" : "   ",
+			last_hc_fifo[i].coord_idx,
+			last_hc_fifo[i].active_bit,
+			(last_hc_fifo[i].coord_updated) ? "(+)" : ""
+			);
+	}
+}
+#else
+#define syna_hc_update_and_push(tcm, hc) do {} while (0)
+#define syna_hc_dump(tcm) do {} while (0)
+#endif /* #ifdef SEC_TS_HC_KFIFO_LEN */
+
+#ifdef SYNA_DEBUG_KFIFO_LEN
+inline void syna_kfifo_push_coord(struct syna_tcm *tcm, u8 slot)
+{
+	if (slot < MAX_NUM_OBJECTS) {
+		/*
+		 * Use kfifo as circular buffer by skipping one element
+		 * when fifo is full.
+		 */
+		if (kfifo_is_full(&debug_fifo))
+			kfifo_skip(&debug_fifo);
+		kfifo_in(&debug_fifo, &tcm->syna_hc.touch_info_fifo[slot], 1);
+	}
+}
+
+inline void syna_debug_dump(struct syna_tcm *tcm)
+{
+	int i;
+	u32 count;
+	s64 delta;
+	s64 sec_longest_duration;
+	u32 ms_longest_duration;
+	s64 sec_delta_down;
+	u32 ms_delta_down;
+	s64 sec_delta_duration;
+	u32 ms_delta_duration;
+	s32 px_delta_x, px_delta_y;
+	ktime_t current_time = ktime_get();
+	struct syna_touch_info_fifo last_touch_info_fifo[SYNA_DEBUG_KFIFO_LEN] = { 0 };
+
+	sec_longest_duration = div_u64_rem(tcm->syna_hc.longest_duration,
+				MSEC_PER_SEC, &ms_longest_duration);
+
+	count = min(tcm->syna_hc.pressed_cnt, (u32) ARRAY_SIZE(last_touch_info_fifo));
+	if (kfifo_out_peek(&debug_fifo, last_touch_info_fifo, count) != count) {
+		LOGE("Fail to peak touch event data.\n");
+		return;
+	}
+
+	for (i = 0 ; i < count; i++) {
+		sec_delta_down = -1;
+		ms_delta_down = 0;
+		/* calculate the delta of finger down from current time. */
+		delta = ktime_ms_delta(current_time, last_touch_info_fifo[i].ktime_pressed);
+		if (delta > 0)
+			sec_delta_down = div_u64_rem(delta, MSEC_PER_SEC, &ms_delta_down);
+
+		/* calculate the delta of finger duration between finger up and down. */
+		sec_delta_duration = -1;
+		ms_delta_duration = 0;
+		px_delta_x = 0;
+		px_delta_y = 0;
+		delta = ktime_ms_delta(last_touch_info_fifo[i].ktime_released,
+				last_touch_info_fifo[i].ktime_pressed);
+		if (delta > 0) {
+			sec_delta_duration = div_u64_rem(delta, MSEC_PER_SEC, &ms_delta_duration);
+			px_delta_x = last_touch_info_fifo[i].x - last_touch_info_fifo[i].x_pressed;
+			px_delta_y = last_touch_info_fifo[i].y - last_touch_info_fifo[i].y_pressed;
+		}
+		LOGI("dump: #%u: %lld.%u(%lld.%u) D(%d, %d).\n",
+			last_touch_info_fifo[i].idx,
+			sec_delta_down, ms_delta_down,
+			sec_delta_duration, ms_delta_duration,
+			px_delta_x, px_delta_y);
+	}
+	LOGI("reset %u, longest %lld.%u.\n",
+		tcm->syna_hc.reset_cnt, sec_longest_duration, ms_longest_duration);
+	LOGI("dump: cnt %u, wet %u, palm %u.\n",
+		tcm->syna_hc.pressed_cnt, tcm->syna_hc.wet_cnt, tcm->syna_hc.palm_cnt);
+}
+#else
+#define syna_kfifo_push_coord(tcm, slot) do {} while (0)
+#define syna_debug_dump(tcm) do {} while (0)
+#endif /* #ifdef SEC_TS_DEBUG_KFIFO_LEN */
 
 /**
  * syna_dev_enable_lowpwr_gesture()
@@ -413,7 +555,7 @@ static void syna_set_palm_mode_work(struct work_struct *work)
 /**
  * syna_dev_reset_detected_cb()
  *
- * Callback to assign a task to helper thread.
+ * Callback to assign a task to event workqueue.
  *
  * Please be noted that this function will be invoked in ISR so don't
  * issue another touchcomm command here.
@@ -428,11 +570,6 @@ static void syna_dev_reset_detected_cb(void *callback_data)
 {
 	struct syna_tcm *tcm = (struct syna_tcm *)callback_data;
 
-	if (!tcm->helper.workqueue) {
-		LOGW("No helper thread created\n");
-		return;
-	}
-
 #ifdef RESET_ON_RESUME
 	if (tcm->pwr_state != PWR_ON)
 		return;
@@ -441,8 +578,9 @@ static void syna_dev_reset_detected_cb(void *callback_data)
 	if (ATOMIC_GET(tcm->helper.task) == HELP_NONE) {
 		ATOMIC_SET(tcm->helper.task, HELP_RESET_DETECTED);
 
-		queue_work(tcm->helper.workqueue, &tcm->helper.work);
+		queue_work(tcm->event_wq, &tcm->helper.work);
 	}
+	tcm->syna_hc.reset_cnt++;
 }
 /**
  * syna_dev_helper_work()
@@ -672,24 +810,35 @@ static void syna_dev_free_input_events(struct syna_tcm *tcm)
 #ifdef TYPE_B_PROTOCOL
 	unsigned int idx;
 #endif
+	s64 ms_delta;
 
 	if (input_dev == NULL)
 		return;
 
 	syna_pal_mutex_lock(&tcm->tp_event_mutex);
 
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
+	for (idx = 0; idx < MAX_NUM_OBJECTS; idx++) {
+		tcm->offload.coords[idx].status = COORD_STATUS_INACTIVE;
+		tcm->offload.coords[idx].major = 0;
+		tcm->offload.coords[idx].minor = 0;
+		tcm->offload.coords[idx].pressure = 0;
+	}
+
+	/* If the previous coord_frame that was pushed to touch_offload had
+	 * active coords (eg. there are fingers still on the screen), push an
+	 * empty coord_frame to touch_offload for clearing coords in twoshay.*/
+	if (tcm->touch_offload_active_coords && tcm->offload.offload_running) {
+		tcm->offload_reserved_coords = true;
+		LOGI("active coords %u", tcm->touch_offload_active_coords);
+		reserve_then_queue_frame(tcm, false);
+	} else {
+#endif
 #ifdef TYPE_B_PROTOCOL
 	for (idx = 0; idx < MAX_NUM_OBJECTS; idx++) {
 		input_mt_slot(input_dev, idx);
 		input_report_abs(input_dev, ABS_MT_PRESSURE, 0);
 		input_mt_report_slot_state(input_dev, MT_TOOL_FINGER, 0);
-
-#if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
-		tcm->offload.coords[idx].status = COORD_STATUS_INACTIVE;
-		tcm->offload.coords[idx].major = 0;
-		tcm->offload.coords[idx].minor = 0;
-		tcm->offload.coords[idx].pressure = 0;
-#endif
 	}
 #endif
 	input_report_key(input_dev, BTN_TOUCH, 0);
@@ -698,6 +847,25 @@ static void syna_dev_free_input_events(struct syna_tcm *tcm)
 	input_mt_sync(input_dev);
 #endif
 	input_sync(input_dev);
+
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
+	}
+#endif
+
+	for (idx = 0; idx < MAX_NUM_OBJECTS; idx++) {
+		if (tcm->prev_obj_status[idx] != LIFT) {
+			tcm->syna_hc.touch_info_fifo[idx].ktime_released = ktime_get();
+
+			ms_delta = ktime_ms_delta(tcm->syna_hc.touch_info_fifo[idx].ktime_released,
+					tcm->syna_hc.touch_info_fifo[idx].ktime_pressed);
+			if (tcm->syna_hc.longest_duration < ms_delta)
+				tcm->syna_hc.longest_duration = ms_delta;
+
+			/* Special case to push into kfifo during release all fingers. */
+			syna_kfifo_push_coord(tcm, idx);
+			tcm->prev_obj_status[idx] = LIFT;
+		}
+	}
 
 	syna_pal_mutex_unlock(&tcm->tp_event_mutex);
 
@@ -738,6 +906,7 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 	unsigned int max_objects = tcm->tcm_dev->max_objects;
 	struct tcm_touch_data_blob *touch_data;
 	struct tcm_objects_data_blob *object_data;
+	s64 ms_delta;
 
 	if (input_dev == NULL)
 		return;
@@ -788,6 +957,17 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
 			}
 #endif
+
+			tcm->syna_hc.touch_info_fifo[idx].ktime_released = tcm->isr_timestamp;
+			ms_delta = ktime_ms_delta(tcm->syna_hc.touch_info_fifo[idx].ktime_released,
+					tcm->syna_hc.touch_info_fifo[idx].ktime_pressed);
+			if (tcm->syna_hc.longest_duration < ms_delta)
+				tcm->syna_hc.longest_duration = ms_delta;
+
+			tcm->syna_hc.touch_info_fifo[idx].idx = idx;
+			syna_kfifo_push_coord(tcm, idx);
+
+			__clear_bit(idx, &tcm->syna_hc.touch_idx_state);
 			break;
 		case FINGER:
 		case GLOVED_OBJECT:
@@ -888,6 +1068,17 @@ static void syna_dev_report_input_events(struct syna_tcm *tcm)
 			}
 #endif
 			LOGD("Finger %d: x = %d, y = %d, z = %d\n", idx, x, y, z);
+
+			if (tcm->prev_obj_status[idx] == LIFT) {
+				tcm->syna_hc.touch_info_fifo[idx].x_pressed = x;
+				tcm->syna_hc.touch_info_fifo[idx].y_pressed = y;
+				tcm->syna_hc.touch_info_fifo[idx].ktime_pressed =
+					tcm->isr_timestamp;
+				tcm->syna_hc.pressed_cnt++;
+			}
+			tcm->syna_hc.touch_info_fifo[idx].x = x;
+			tcm->syna_hc.touch_info_fifo[idx].y = y;
+			__set_bit(idx, &tcm->syna_hc.touch_idx_state);
 			touch_count++;
 			break;
 		default:
@@ -1277,6 +1468,7 @@ static void syna_populate_coordinate_channel(struct syna_tcm *tcm,
 					     int channel)
 {
 	int j;
+	u8 active_coords = 0;
 
 	struct TouchOffloadDataCoord *dc =
 		(struct TouchOffloadDataCoord *)frame->channel_data[channel];
@@ -1291,7 +1483,11 @@ static void syna_populate_coordinate_channel(struct syna_tcm *tcm,
 		dc->coords[j].minor = tcm->offload.coords[j].minor;
 		dc->coords[j].pressure = tcm->offload.coords[j].pressure;
 		dc->coords[j].status = tcm->offload.coords[j].status;
+		if (dc->coords[j].status != COORD_STATUS_INACTIVE)
+			active_coords += 1;
 	}
+
+	tcm->touch_offload_active_coords = active_coords;
 }
 
 static void syna_populate_mutual_channel(struct syna_tcm *tcm,
@@ -1473,6 +1669,7 @@ static irqreturn_t syna_dev_isr(int irq, void *handle)
 	struct syna_tcm *tcm = handle;
 
 	tcm->isr_timestamp = ktime_get();
+	tcm->syna_hc.int_cnt++;
 
 	return IRQ_WAKE_THREAD;
 }
@@ -1499,6 +1696,7 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 	struct custom_fw_status *status;
 	struct syna_hw_attn_data *attn = &tcm->hw_if->bdata_attn;
 	struct tcm_dev *tcm_dev = tcm->tcm_dev;
+	memset(&tcm->syna_hc.hc_fifo, 0, sizeof(tcm->syna_hc.hc_fifo));
 
 	ATRACE_BEGIN(__func__);
 
@@ -1563,6 +1761,8 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 			goto exit;
 		}
 		tcm->coords_timestamp = tcm->isr_timestamp;
+		tcm->syna_hc.coord_event_cnt++;
+		tcm->syna_hc.hc_fifo.coord_updated = true;
 
 		/* forward the touch event to system */
 		ATRACE_BEGIN("report_input_events");
@@ -1615,10 +1815,22 @@ static irqreturn_t syna_dev_interrupt_thread(int irq, void *data)
 		LOGI("Status: moisture:%d noise:%d freq-change:%d, grip:%d, palm:%d\n",
 			status->b0_moisture, status->b1_noise_state,
 			status->b2_freq_hopping, status->b3_grip, status->b4_palm);
+
+		if (status->b0_moisture)
+			tcm->syna_hc.wet_cnt++;
+
+		if (status->b4_palm)
+			tcm->syna_hc.palm_cnt++;
+
+		tcm->syna_hc.status_event_cnt++;
+		tcm->syna_hc.hc_fifo.status_updated = true;
 		break;
 	default:
 		break;
 	}
+
+	/* Update the health check info. */
+	syna_hc_update_and_push(tcm, &tcm->syna_hc.hc_fifo);
 
 exit:
 	syna_set_bus_ref(tcm, SYNA_BUS_REF_IRQ, false);
@@ -2268,13 +2480,10 @@ static int syna_dev_suspend(struct device *dev)
 				LOGE("Fail to complete hw reset, ret = %d, status = %d\n",
 				     retval, status);
 			}
-			return retval;
 		}
 		retval = syna_dev_enter_lowpwr_sensing(tcm);
-		if (retval < 0) {
+		if (retval < 0)
 			LOGE("Fail to enter suspended power mode after reset.\n");
-			return retval;
-		}
 	}
 	tcm->pwr_state = LOW_PWR;
 #else
@@ -2299,7 +2508,8 @@ static int syna_dev_suspend(struct device *dev)
 		tbn_release_bus(tcm->tbn_register_mask);
 #endif
 
-	LOGI("Device suspended (pwr_state:%d)\n", tcm->pwr_state);
+	LOGI("Device suspended (pwr_state:%d), int_cnt:%llu\n", tcm->pwr_state,
+	     tcm->syna_hc.int_cnt);
 #ifdef CONFIG_UCI
 	pr_info("%s uci screen state call %d... \n",__func__,0);
 	uci_screen_state(0);
@@ -2436,6 +2646,8 @@ static void syna_suspend_work(struct work_struct *work)
 	struct syna_tcm *tcm = container_of(work, struct syna_tcm, suspend_work);
 
 	syna_dev_suspend(&tcm->pdev->dev);
+	syna_hc_dump(tcm);
+	syna_debug_dump(tcm);
 }
 
 static void syna_resume_work(struct work_struct *work)
@@ -2443,6 +2655,12 @@ static void syna_resume_work(struct work_struct *work)
 	struct syna_tcm *tcm = container_of(work, struct syna_tcm, resume_work);
 
 	syna_dev_resume(&tcm->pdev->dev);
+
+	tcm->syna_hc.reset_cnt = 0;
+	tcm->syna_hc.longest_duration = 0;
+	tcm->syna_hc.pressed_cnt = 0;
+	tcm->syna_hc.palm_cnt = 0;
+	tcm->syna_hc.wet_cnt = 0;
 }
 
 void syna_aggregate_bus_state(struct syna_tcm *tcm)
@@ -2963,6 +3181,11 @@ static int syna_dev_probe(struct platform_device *pdev)
 	init_completion(&tcm->raw_data_completion);
 	complete_all(&tcm->raw_data_completion);
 
+	tcm->syna_hc.int_cnt = 0;
+	tcm->syna_hc.coord_event_cnt = 0;
+	tcm->syna_hc.status_event_cnt = 0;
+	tcm->syna_hc.touch_idx_state = 0;
+
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
 	tcm->offload.caps.touch_offload_major_version = TOUCH_OFFLOAD_INTERFACE_MAJOR_VERSION;
 	tcm->offload.caps.touch_offload_minor_version = TOUCH_OFFLOAD_INTERFACE_MINOR_VERSION;
@@ -2981,7 +3204,7 @@ static int syna_dev_probe(struct platform_device *pdev)
 					     TOUCH_SCAN_TYPE_SELF;
 	tcm->offload.caps.continuous_reporting = true;
 	tcm->offload.caps.noise_reporting = false;
-	tcm->offload.caps.cancel_reporting = false;
+	tcm->offload.caps.cancel_reporting = true;
 	tcm->offload.caps.size_reporting = true;
 	tcm->offload.caps.rotation_reporting = true;
 	tcm->offload.caps.filter_grip = true;
@@ -3001,6 +3224,8 @@ static int syna_dev_probe(struct platform_device *pdev)
 			goto err_connect;
 		}
 	}
+
+	tcm->touch_offload_active_coords = 0;
 #endif
 
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_HEATMAP)
@@ -3074,8 +3299,6 @@ static int syna_dev_probe(struct platform_device *pdev)
 
 #if defined(ENABLE_HELPER)
 	ATOMIC_SET(tcm->helper.task, HELP_NONE);
-	tcm->helper.workqueue =
-			create_singlethread_workqueue("synaptics_tcm_helper");
 	INIT_WORK(&tcm->helper.work, syna_dev_helper_work);
 	/* set up custom touch data parsing method */
 	syna_tcm_set_reset_occurrence_callback(tcm_dev,
@@ -3146,8 +3369,6 @@ static int syna_dev_remove(struct platform_device *pdev)
 	}
 #if defined(ENABLE_HELPER)
 	cancel_work_sync(&tcm->helper.work);
-	flush_workqueue(tcm->helper.workqueue);
-	destroy_workqueue(tcm->helper.workqueue);
 #endif
 
 	cancel_work_sync(&tcm->suspend_work);
