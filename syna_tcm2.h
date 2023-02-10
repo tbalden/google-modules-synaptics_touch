@@ -338,7 +338,6 @@ enum helper_task {
 struct syna_tcm_helper {
 	syna_pal_atomic_t task;
 	struct work_struct work;
-	struct workqueue_struct *workqueue;
 };
 #endif
 
@@ -396,6 +395,43 @@ enum custom_data {
 	CUSTOM_DATA_MINOR = 0x2,
 };
 #endif
+
+struct syna_health_check_fifo {
+	ktime_t int_ktime;
+	u64 int_idx;
+	u64 coord_idx;
+	u64 status_idx;
+	/* Slot active bit from FW. */
+	unsigned long active_bit;
+	/* Check whether have coord, status or unknown event. */
+	bool coord_updated;
+	bool status_updated;
+};
+
+struct syna_touch_info_fifo {
+	u8 idx;
+	u16 x_pressed;	/* x coord on first down timing. */
+	u16 y_pressed;	/* y coord on first down timing. */
+	u16 x;
+	u16 y;
+	ktime_t ktime_pressed;
+	ktime_t ktime_released;
+};
+
+struct syna_health_check {
+	struct syna_health_check_fifo hc_fifo;
+	u64 int_cnt;
+	u64 coord_event_cnt;
+	u64 status_event_cnt;
+	unsigned long touch_idx_state;
+
+	struct syna_touch_info_fifo touch_info_fifo[MAX_NUM_OBJECTS];
+	u32 reset_cnt;
+	u32 wet_cnt;
+	u32 palm_cnt;
+	u32 pressed_cnt;
+	s64 longest_duration; /* ms unit */
+};
 
 /**
  * @brief: context of the synaptics linux-based driver
@@ -465,11 +501,14 @@ struct syna_tcm {
 				* CLOCK_MONOTONIC */
 	ktime_t coords_timestamp;
 
+	struct syna_health_check syna_hc;
+
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_OFFLOAD)
 	struct touch_offload_context offload;
 	u16 *heatmap_buff;
 	struct touch_offload_frame *reserved_frame;
-	bool reserved_frame_success;
+	bool offload_reserved_coords;
+	u8 touch_offload_active_coords;
 #endif
 
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_HEATMAP)
@@ -493,6 +532,11 @@ struct syna_tcm {
 	ktime_t mf_downtime;
 	/* Work for motion filter commands. */
 	struct work_struct motion_filter_work;
+
+	/* Work for setting firmware grip mode. */
+	struct work_struct set_grip_mode_work;
+	/* Work for setting firmware palm mode. */
+	struct work_struct set_palm_mode_work;
 
 	/* IOCTL-related variables */
 	pid_t proc_pid;
@@ -522,6 +566,8 @@ struct syna_tcm {
 	bool high_sensitivity_mode;
 	u8 enable_fw_grip;
 	u8 enable_fw_palm;
+	u8 next_enable_fw_grip;
+	u8 next_enable_fw_palm;
 
 #if defined(USE_DRM_BRIDGE)
 	struct drm_bridge panel_bridge;
@@ -628,6 +674,8 @@ void syna_cdev_update_report_queue(struct syna_tcm *tcm,
 
 #endif
 int syna_set_bus_ref(struct syna_tcm *tcm, u32 ref, bool enable);
+void syna_hc_dump(struct syna_tcm *tcm);
+void syna_debug_dump(struct syna_tcm *tcm);
 
 #endif /* end of _SYNAPTICS_TCM2_DRIVER_H_ */
 

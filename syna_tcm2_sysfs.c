@@ -706,10 +706,13 @@ static ssize_t syna_sysfs_force_active_store(struct kobject *kobj,
 	LOGI("Set bus reference bit %#x %s.", ref,
 	     active ? "enable" : "disable");
 
-	if (active)
+	if (active) {
 		pm_stay_awake(&tcm->pdev->dev);
-	else
+		syna_hc_dump(tcm);
+		syna_debug_dump(tcm);
+	} else {
 		pm_relax(&tcm->pdev->dev);
+	}
 
 	retval = syna_set_bus_ref(tcm, ref, active);
 	if (retval < 0) {
@@ -881,7 +884,7 @@ exit:
 }
 
 static struct kobj_attribute kobj_attr_get_raw_data =
-	__ATTR(get_raw_data, 0664, syna_sysfs_get_raw_data_show, syna_sysfs_get_raw_data_store);
+	__ATTR(get_raw_data, 0644, syna_sysfs_get_raw_data_show, syna_sysfs_get_raw_data_store);
 
 /**
  * syna_sysfs_high_sensitivity_show()
@@ -970,7 +973,7 @@ static ssize_t syna_sysfs_high_sensitivity_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute kobj_attr_high_sensitivity =
-	__ATTR(high_sensitivity, 0664, syna_sysfs_high_sensitivity_show,
+	__ATTR(high_sensitivity, 0644, syna_sysfs_high_sensitivity_show,
 	       syna_sysfs_high_sensitivity_store);
 
 /**
@@ -1063,7 +1066,7 @@ static ssize_t syna_sysfs_fw_grip_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute kobj_attr_fw_grip =
-	__ATTR(fw_grip, 0664, syna_sysfs_fw_grip_show,
+	__ATTR(fw_grip, 0644, syna_sysfs_fw_grip_show,
 	       syna_sysfs_fw_grip_store);
 
 /**
@@ -1156,7 +1159,7 @@ static ssize_t syna_sysfs_fw_palm_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute kobj_attr_fw_palm =
-	__ATTR(fw_palm, 0664, syna_sysfs_fw_palm_show,
+	__ATTR(fw_palm, 0644, syna_sysfs_fw_palm_show,
 	       syna_sysfs_fw_palm_store);
 
 /**
@@ -1241,7 +1244,7 @@ static ssize_t syna_sysfs_mf_mode_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute kobj_attr_mf_mode =
-	__ATTR(mf_mode, 0664, syna_sysfs_mf_mode_show,
+	__ATTR(mf_mode, 0644, syna_sysfs_mf_mode_show,
 	       syna_sysfs_mf_mode_store);
 
 /**
@@ -1329,7 +1332,7 @@ static ssize_t syna_sysfs_compression_threshold_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute kobj_attr_compression_threshold =
-	__ATTR(compression_threshold, 0664, syna_sysfs_compression_threshold_show,
+	__ATTR(compression_threshold, 0644, syna_sysfs_compression_threshold_show,
 	       syna_sysfs_compression_threshold_store);
 
 /**
