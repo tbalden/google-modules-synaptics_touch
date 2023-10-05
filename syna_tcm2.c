@@ -1419,6 +1419,23 @@ static void syna_offload_report(void *handle,
 	ATRACE_END();
 }
 
+static int syna_heatmap_alloc_check(struct syna_tcm *tcm)
+{
+	if (tcm->heatmap_buff)
+	        return 0;
+
+	tcm->heatmap_buff = devm_kzalloc(&tcm->pdev->dev,
+			sizeof(u16) * tcm->tcm_dev->rows * tcm->tcm_dev->cols, GFP_KERNEL);
+	if (!tcm->heatmap_buff) {
+		LOGE("allocate heatmap_buff failed\n");
+		return -ENOMEM;
+	}
+	LOGI("Allocate heatmap memory, rows: %d, cols: %d\n", tcm->tcm_dev->rows,
+	     tcm->tcm_dev->cols);
+
+	return 0;
+}
+
 static int syna_dev_ptflib_decoder(struct syna_tcm *tcm, const u16 *in_array,
 				   const int in_array_size, u16 *out_array,
 				   const int out_array_max_size)
@@ -1504,6 +1521,9 @@ static void syna_populate_mutual_channel(struct syna_tcm *tcm,
 	mutual_strength->header.channel_size =
 		TOUCH_OFFLOAD_FRAME_SIZE_2D(mutual_strength->rx_size,
 					    mutual_strength->tx_size);
+
+	if (syna_heatmap_alloc_check(tcm) != 0)
+		return;
 
 	if (has_heatmap) {
 		/* for 'heat map' ($c3) report,
@@ -1635,6 +1655,9 @@ static bool v4l2_read_frame(struct v4l2_heatmap *v4l2)
 			memcpy(v4l2->frame, tcm->heatmap_buff,
 			       tcm->v4l2.width * tcm->v4l2.height * sizeof(u16));
 		} else {
+		    if (syna_heatmap_alloc_check(tcm) != 0)
+			return false;
+
 		    /* for 'heat map' ($c3) report,
 		     * report data has been stored at tcm->event_data.buf;
 		     * while, tcm->event_data.data_length is the size of data
@@ -2890,16 +2913,6 @@ static int syna_dev_disconnect(struct syna_tcm *tcm)
 		return 0;
 	}
 
-#ifdef STARTUP_REFLASH
-	cancel_delayed_work_sync(&tcm->reflash_work);
-	flush_workqueue(tcm->reflash_workqueue);
-	destroy_workqueue(tcm->reflash_workqueue);
-#endif
-
-	/* free interrupt line */
-	if (hw_if->bdata_attn.irq_id)
-		syna_dev_release_irq(tcm);
-
 	/* unregister input device */
 	syna_dev_release_input_device(tcm);
 
@@ -3000,26 +3013,6 @@ static int syna_dev_connect(struct syna_tcm *tcm)
 		break;
 	}
 
-	/* register the interrupt handler */
-	retval = syna_dev_request_irq(tcm);
-	if (retval < 0) {
-		LOGE("Fail to request the interrupt line\n");
-		goto err_request_irq;
-	}
-
-	/* for the reference,
-	 * create a delayed work to perform fw update during the startup time
-	 */
-#ifdef STARTUP_REFLASH
-	tcm->force_reflash = false;
-	tcm->reflash_count = 0;
-	tcm->reflash_workqueue =
-			create_singlethread_workqueue("syna_reflash");
-	INIT_DELAYED_WORK(&tcm->reflash_work, syna_dev_reflash_startup_work);
-	queue_delayed_work(tcm->reflash_workqueue, &tcm->reflash_work,
-			msecs_to_jiffies(STARTUP_REFLASH_DELAY_TIME_MS));
-#endif
-
 	tcm->pwr_state = PWR_ON;
 	tcm->is_connected = true;
 	tcm->bus_refmask = SYNA_BUS_REF_SCREEN_ON;
@@ -3032,10 +3025,6 @@ static int syna_dev_connect(struct syna_tcm *tcm)
 		(hw_if->ops_enable_irq) ? "yes" : "no");
 
 	return 0;
-
-err_request_irq:
-	/* unregister input device */
-	syna_dev_release_input_device(tcm);
 
 err_setup_input_dev:
 err_detect_dev:
@@ -3224,15 +3213,8 @@ static int syna_dev_probe(struct platform_device *pdev)
 	tcm->offload.report_cb = syna_offload_report;
 	touch_offload_init(&tcm->offload);
 
-	if (!tcm->heatmap_buff) {
-		tcm->heatmap_buff = kmalloc(
-				    sizeof(u16) * tcm->tcm_dev->rows * tcm->tcm_dev->cols,
-				    GFP_KERNEL);
-		if (!tcm->heatmap_buff) {
-			LOGE("allocate heatmap_buff failed\n");
-			goto err_connect;
-		}
-	}
+	if (syna_heatmap_alloc_check(tcm) != 0)
+		goto err_connect;
 
 	tcm->touch_offload_active_coords = 0;
 #endif
@@ -3265,6 +3247,29 @@ static int syna_dev_probe(struct platform_device *pdev)
 	tcm->touch_report_rate_config = CONFIG_HIGH_REPORT_RATE;
 	INIT_DELAYED_WORK(&tcm->set_report_rate_work, syna_set_report_rate_work);
 
+	retval = syna_dev_request_irq(tcm);
+	if (retval < 0) {
+		LOGE("Fail to request the interrupt line\n");
+		goto err_request_irq;
+	}
+
+	tcm->enable_fw_grip = 0x00;
+	tcm->enable_fw_palm = 0x01;
+	syna_dev_restore_feature_setting(tcm, RESP_IN_POLLING);
+
+	/* for the reference,
+	 * create a delayed work to perform fw update during the startup time
+	 */
+#ifdef STARTUP_REFLASH
+	tcm->force_reflash = false;
+	tcm->reflash_count = 0;
+	tcm->reflash_workqueue =
+			create_singlethread_workqueue("syna_reflash");
+	INIT_DELAYED_WORK(&tcm->reflash_work, syna_dev_reflash_startup_work);
+	queue_delayed_work(tcm->reflash_workqueue, &tcm->reflash_work,
+			msecs_to_jiffies(STARTUP_REFLASH_DELAY_TIME_MS));
+#endif
+
 #ifdef HAS_SYSFS_INTERFACE
 	/* create the device file and register to char device classes */
 	retval = syna_cdev_create_sysfs(tcm, pdev);
@@ -3274,10 +3279,6 @@ static int syna_dev_probe(struct platform_device *pdev)
 		goto err_create_cdev;
 	}
 #endif
-
-	tcm->enable_fw_grip = 0x00;
-	tcm->enable_fw_palm = 0x01;
-	syna_dev_restore_feature_setting(tcm, RESP_IN_POLLING);
 
 #if defined(USE_DRM_BRIDGE)
 	retval = syna_register_panel_bridge(tcm);
@@ -3324,9 +3325,17 @@ static int syna_dev_probe(struct platform_device *pdev)
 
 #ifdef HAS_SYSFS_INTERFACE
 err_create_cdev:
-
 	syna_tcm_remove_device(tcm->tcm_dev);
+#ifdef STARTUP_REFLASH
+	cancel_delayed_work_sync(&tcm->reflash_work);
+	flush_workqueue(tcm->reflash_workqueue);
+	destroy_workqueue(tcm->reflash_workqueue);
 #endif
+	/* free interrupt line */
+	if (tcm->hw_if->bdata_attn.irq_id)
+		syna_dev_release_irq(tcm);
+#endif
+err_request_irq:
 #if defined(TCM_CONNECT_IN_PROBE)
 	tcm->dev_disconnect(tcm);
 
@@ -3408,6 +3417,16 @@ static int syna_dev_remove(struct platform_device *pdev)
 	/* remove the cdev and sysfs nodes */
 	syna_cdev_remove_sysfs(tcm);
 #endif
+
+#ifdef STARTUP_REFLASH
+	cancel_delayed_work_sync(&tcm->reflash_work);
+	flush_workqueue(tcm->reflash_workqueue);
+	destroy_workqueue(tcm->reflash_workqueue);
+#endif
+
+	/* free interrupt line */
+	if (tcm->hw_if->bdata_attn.irq_id)
+		syna_dev_release_irq(tcm);
 
 	/* check the connection statusm, and do disconnection */
 	if (tcm->dev_disconnect(tcm) < 0)
