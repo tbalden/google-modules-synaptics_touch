@@ -2339,6 +2339,10 @@ static void syna_check_finger_status(struct syna_tcm *tcm)
 	}
 }
 
+#ifdef CONFIG_UCI
+extern void uci_screen_state(int state);
+#endif
+
 /**
  * syna_dev_resume()
  *
